@@ -61,9 +61,13 @@ def align_image(image, dy, dx):
     """
     return ndshift(image, shift=(-dy, -dx), mode='constant', cval=0)
 
-def estimate_affine_transform(reference, target, mask=None):
+def estimate_affine_transform(reference, target, mask=None, use_full_affine=True):
     """
-    Estimate affine transformation (translation + rotation + scale) using ECC algorithm.
+    Estimate transformation using ECC algorithm.
+    
+    If use_full_affine=True: Uses full affine (translation + rotation + scale + shear)
+    If use_full_affine=False: Uses Euclidean (translation + rotation only)
+    
     Returns the transformation matrix and the estimated parameters.
     """
     # Normalize images to 0-255 uint8 for OpenCV
@@ -85,34 +89,43 @@ def estimate_affine_transform(reference, target, mask=None):
     ref_uint8 = (ref * 255).astype(np.uint8)
     tgt_uint8 = (tgt * 255).astype(np.uint8)
     
-    # Define the motion model (Euclidean = translation + rotation)
-    warp_mode = cv2.MOTION_EUCLIDEAN
+    # Define the motion model
+    if use_full_affine:
+        # Full affine: translation + rotation + scale + shear (6 DOF)
+        warp_mode = cv2.MOTION_AFFINE
+    else:
+        # Euclidean: translation + rotation only (3 DOF)
+        warp_mode = cv2.MOTION_EUCLIDEAN
     
     # Initialize the transformation matrix (identity)
     warp_matrix = np.eye(2, 3, dtype=np.float32)
     
     # Define termination criteria
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 1000, 1e-6)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 2000, 1e-7)
     
     try:
-        # Run ECC algorithm
+        # Run ECC algorithm with multiple pyramid levels for robustness
         _, warp_matrix = cv2.findTransformECC(
             ref_uint8, tgt_uint8, warp_matrix, warp_mode, criteria,
             inputMask=None, gaussFiltSize=5
         )
         
         # Extract parameters from warp matrix
-        # For Euclidean: [[cos(θ), -sin(θ), tx], [sin(θ), cos(θ), ty]]
         dx = warp_matrix[0, 2]
         dy = warp_matrix[1, 2]
+        
+        # For affine, extract scale and rotation
+        # [[a, b, tx], [c, d, ty]] where a=sx*cos(θ), b=-sy*sin(θ), c=sx*sin(θ), d=sy*cos(θ)
+        sx = np.sqrt(warp_matrix[0, 0]**2 + warp_matrix[1, 0]**2)
+        sy = np.sqrt(warp_matrix[0, 1]**2 + warp_matrix[1, 1]**2)
         angle_rad = np.arctan2(warp_matrix[1, 0], warp_matrix[0, 0])
         angle_deg = np.degrees(angle_rad)
         
-        return warp_matrix, dx, dy, angle_deg
+        return warp_matrix, dx, dy, angle_deg, sx, sy
         
     except cv2.error as e:
         # ECC failed, return identity
-        return warp_matrix, 0.0, 0.0, 0.0
+        return warp_matrix, 0.0, 0.0, 0.0, 1.0, 1.0
 
 def align_image_affine(image, warp_matrix):
     """
@@ -128,6 +141,68 @@ def align_image_affine(image, warp_matrix):
         borderValue=0
     )
     return aligned
+
+
+def compute_optical_flow_warp(reference, target, mask=None, fine_mode=False):
+    """
+    Compute dense optical flow from target to reference and return the warped target.
+    Uses Farneback optical flow for sub-pixel accuracy deformable registration.
+    
+    fine_mode: Use smaller windows for better local accuracy on small features.
+    """
+    # Normalize to 0-255 uint8 for optical flow
+    ref_norm = cv2.normalize(reference, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    tgt_norm = cv2.normalize(target, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    
+    # Less blur for fine mode to preserve small features
+    blur_size = (7, 7) if fine_mode else (15, 15)
+    ref_blur = cv2.GaussianBlur(ref_norm, blur_size, 0)
+    tgt_blur = cv2.GaussianBlur(tgt_norm, blur_size, 0)
+    
+    # Fine mode: smaller windows, more levels, more iterations for small features
+    if fine_mode:
+        flow = cv2.calcOpticalFlowFarneback(
+            ref_blur, tgt_blur, None,
+            pyr_scale=0.5,
+            levels=7,        # More pyramid levels
+            winsize=11,      # Smaller window = more local
+            iterations=10,   # More iterations
+            poly_n=5,        # Smaller neighborhood
+            poly_sigma=1.1,
+            flags=0
+        )
+    else:
+        flow = cv2.calcOpticalFlowFarneback(
+            ref_blur, tgt_blur, None,
+            pyr_scale=0.5,
+            levels=5,
+            winsize=21,
+            iterations=5,
+            poly_n=7,
+            poly_sigma=1.5,
+            flags=0
+        )
+    
+    # Create remap coordinates
+    h, w = reference.shape[:2]
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    
+    # Warp target to reference using flow
+    map_x = (x + flow[..., 0]).astype(np.float32)
+    map_y = (y + flow[..., 1]).astype(np.float32)
+    
+    warped = cv2.remap(target, map_x, map_y, cv2.INTER_LINEAR, 
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    
+    # Compute average flow magnitude
+    flow_mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+    if mask is not None and np.any(mask):
+        avg_flow = np.mean(flow_mag[mask])
+    else:
+        avg_flow = np.mean(flow_mag)
+    
+    return warped, avg_flow
+
 
 def register_and_stack_measurements(hybrid_maps, reference_idx=0, max_shift=50, masks=None, use_affine=True):
     """
@@ -171,10 +246,12 @@ def register_and_stack_measurements(hybrid_maps, reference_idx=0, max_shift=50, 
                 combined_mask = None
             
             if use_affine:
-                # Use ECC for affine registration (translation + rotation)
-                warp_matrix, dx, dy, angle = estimate_affine_transform(reference, hmap, mask=combined_mask)
+                # Use ECC for full affine registration (translation + rotation + scale + shear)
+                warp_matrix, dx, dy, angle, sx, sy = estimate_affine_transform(
+                    reference, hmap, mask=combined_mask, use_full_affine=True
+                )
                 shift_magnitude = np.sqrt(dy**2 + dx**2)
-                transforms.append((dx, dy, angle))
+                transforms.append((dx, dy, angle, sx, sy))
                 
                 if shift_magnitude > max_shift:
                     aligned_maps.append(None)
@@ -205,6 +282,166 @@ def register_and_stack_measurements(hybrid_maps, reference_idx=0, max_shift=50, 
     stacked = np.mean(valid_maps, axis=0)
     
     return stacked, transforms, aligned_maps, included
+
+def compute_union_tiered_map(aligned_maps, masks=None, threshold_percentile=80):
+    """
+    Compute a tiered map that preserves unique information from individual measurements.
+    
+    Returns:
+        union_map: Combined map using union of all measurements
+        confidence_map: 0-1 indicating how many measurements contain signal at each pixel
+        tiered_map: Final map with intensity weighted by confidence
+    """
+    n = len(aligned_maps)
+    if n == 0:
+        return None, None, None
+    
+    # Align masks if provided
+    h, w = aligned_maps[0].shape
+    
+    # Create union mask (any measurement covers this pixel)
+    if masks is not None:
+        union_mask = np.zeros((h, w), dtype=bool)
+        for m in masks:
+            if m is not None:
+                union_mask = union_mask | m
+    else:
+        union_mask = np.ones((h, w), dtype=bool)
+    
+    # Compute confidence: how many measurements have signal at each pixel
+    binary_maps = []
+    for amap in aligned_maps:
+        if amap is not None and np.max(amap) > 0:
+            valid_pixels = amap[amap > 0]
+            if len(valid_pixels) > 0:
+                thresh = np.percentile(valid_pixels, threshold_percentile)
+                binary = (amap > thresh).astype(np.float32)
+            else:
+                binary = np.zeros_like(amap)
+        else:
+            binary = np.zeros((h, w), dtype=np.float32)
+        binary_maps.append(binary)
+    
+    # Confidence = fraction of measurements with signal
+    confidence_map = np.mean(binary_maps, axis=0)
+    
+    # Union map: take max across all measurements (preserves unique detections)
+    valid_maps = [m for m in aligned_maps if m is not None]
+    union_map = np.max(valid_maps, axis=0)
+    
+    # Tiered map: weight by confidence
+    # High confidence (>0.5): full intensity
+    # Medium confidence (0.25-0.5): 75% intensity  
+    # Low confidence (<0.25): 50% intensity (still visible but muted)
+    weight = np.ones_like(confidence_map)
+    weight[confidence_map < 0.5] = 0.75
+    weight[confidence_map < 0.25] = 0.5
+    
+    tiered_map = union_map * weight * union_mask
+    
+    return union_map, confidence_map, tiered_map
+
+
+def compute_smart_consensus_map(aligned_maps, masks=None, 
+                                 consensus_threshold=0.5, 
+                                 intensity_percentile=75,
+                                 detection_percentile=80):
+    """
+    Smart Consensus: Combines consensus detections with intensity-validated unique detections.
+    
+    Logic:
+    - If a pixel is detected in 50%+ of measurements → HIGH CONFIDENCE (include)
+    - If a pixel is detected in <50% of measurements:
+        - If its intensity is > 75th percentile → MEDIUM CONFIDENCE (strong unique, include)
+        - If its intensity is < 75th percentile → EXCLUDE (weak unique, likely noise)
+    
+    Returns:
+        smart_map: The final smart consensus map
+        confidence_map: 3-level confidence (1.0=consensus, 0.66=strong unique, 0=excluded)
+        stats: Dictionary with statistics
+    """
+    n = len(aligned_maps)
+    if n == 0:
+        return None, None, {}
+    
+    valid_maps = [m for m in aligned_maps if m is not None]
+    n_valid = len(valid_maps)
+    
+    if n_valid == 0:
+        return None, None, {}
+    
+    h, w = valid_maps[0].shape
+    
+    # Create union mask
+    if masks is not None:
+        union_mask = np.zeros((h, w), dtype=bool)
+        for m in masks:
+            if m is not None:
+                union_mask = union_mask | m
+    else:
+        union_mask = np.ones((h, w), dtype=bool)
+    
+    # Step 1: Compute detection count per pixel
+    binary_maps = []
+    for amap in valid_maps:
+        if np.max(amap) > 0:
+            valid_pixels = amap[amap > 0]
+            if len(valid_pixels) > 0:
+                thresh = np.percentile(valid_pixels, detection_percentile)
+                binary = (amap > thresh).astype(np.float32)
+            else:
+                binary = np.zeros_like(amap)
+        else:
+            binary = np.zeros((h, w), dtype=np.float32)
+        binary_maps.append(binary)
+    
+    # Detection frequency (0 to 1)
+    detection_freq = np.mean(binary_maps, axis=0)
+    
+    # Step 2: Compute max intensity across measurements
+    max_intensity = np.max(valid_maps, axis=0)
+    
+    # Step 3: Compute intensity threshold (75th percentile of all positive values)
+    all_positive = max_intensity[union_mask & (max_intensity > 0)]
+    if len(all_positive) > 0:
+        intensity_thresh = np.percentile(all_positive, intensity_percentile)
+    else:
+        intensity_thresh = 0
+    
+    # Step 4: Build smart consensus map
+    smart_map = np.zeros((h, w), dtype=np.float32)
+    confidence_map = np.zeros((h, w), dtype=np.float32)
+    
+    # Consensus pixels (detected in 50%+ measurements) - HIGH CONFIDENCE
+    consensus_mask = detection_freq >= consensus_threshold
+    smart_map[consensus_mask] = max_intensity[consensus_mask]
+    confidence_map[consensus_mask] = 1.0
+    
+    # Unique pixels (detected in <50%) - check intensity
+    unique_mask = (detection_freq > 0) & (detection_freq < consensus_threshold)
+    
+    # Strong unique (high intensity) - MEDIUM CONFIDENCE
+    strong_unique_mask = unique_mask & (max_intensity >= intensity_thresh)
+    smart_map[strong_unique_mask] = max_intensity[strong_unique_mask]
+    confidence_map[strong_unique_mask] = 0.66
+    
+    # Weak unique (low intensity) - EXCLUDED (left as 0)
+    weak_unique_mask = unique_mask & (max_intensity < intensity_thresh)
+    # These are excluded (remain 0)
+    
+    # Apply union mask
+    smart_map = smart_map * union_mask
+    confidence_map = confidence_map * union_mask
+    
+    # Statistics
+    stats = {
+        'n_consensus': np.sum(consensus_mask & union_mask),
+        'n_strong_unique': np.sum(strong_unique_mask & union_mask),
+        'n_weak_excluded': np.sum(weak_unique_mask & union_mask),
+        'intensity_threshold': intensity_thresh
+    }
+    
+    return smart_map, confidence_map, stats
 
 def compute_stability_map(aligned_maps, threshold_percentile=80):
     """
