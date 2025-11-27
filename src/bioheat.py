@@ -1,5 +1,54 @@
 import numpy as np
+import cv2
 from scipy.ndimage import gaussian_filter, laplace
+
+
+def erode_mask(mask, erosion_px=20):
+    """
+    Erode the mask to exclude boundary artifacts (water bag edge, creases).
+    
+    Args:
+        mask: Boolean mask
+        erosion_px: Number of pixels to erode from boundary
+    
+    Returns:
+        Eroded mask
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erosion_px*2+1, erosion_px*2+1))
+    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
+    return eroded.astype(bool)
+
+
+def suppress_lines(image, line_length=30):
+    """
+    Suppress linear structures (blood vessels, creases) while preserving blob-like features.
+    Uses morphological opening with a circular kernel - removes thin elongated structures.
+    
+    Args:
+        image: Input intensity map
+        line_length: Minimum length of lines to suppress
+    
+    Returns:
+        Filtered image with lines suppressed
+    """
+    # Opening with circular kernel removes thin structures
+    kernel_size = max(5, line_length // 3)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    
+    # Convert to uint8 for morphology
+    if image.max() > 0:
+        img_norm = (image / image.max() * 255).astype(np.uint8)
+    else:
+        return image
+    
+    # Opening removes thin structures smaller than kernel
+    opened = cv2.morphologyEx(img_norm, cv2.MORPH_OPEN, kernel)
+    
+    # Convert back to original scale
+    result = opened.astype(np.float64) / 255.0 * image.max()
+    
+    return result
+
 
 def calculate_standard_bioheat(frames, mask, config):
     """
@@ -59,23 +108,37 @@ def calculate_3d_gradient_score(frames, mask, config):
     score_map = np.clip(score_map, 0, None)
     
     # Robust Normalization (99th percentile = 1.0)
-    if np.max(score_map) > 0:
-        robust_max = np.percentile(score_map[mask & (score_map > 0)], 99.0) if np.any(score_map > 0) else np.max(score_map)
+    masked_positive = score_map[mask & (score_map > 0)]
+    if len(masked_positive) > 0:
+        robust_max = np.percentile(masked_positive, 99.0)
         score_map = score_map / (robust_max + 1e-8)
+        score_map = np.clip(score_map, 0, 1.0)
+    elif np.max(score_map) > 0:
+        score_map = score_map / (np.max(score_map) + 1e-8)
         score_map = np.clip(score_map, 0, 1.0)
         
     return score_map * mask
 
-def calculate_hybrid_preserving(frames, mask, config):
+def calculate_hybrid_preserving(frames, mask, config, boundary_erosion_px=10):
     """
     Hybrid v4: Intensity Preserving Method.
     Combines Physics (Bioheat) with Pattern Rec (Gradient Score).
+    
+    Args:
+        boundary_erosion_px: Pixels to erode from mask boundary to remove edge artifacts.
+                            Set to 0 to disable.
     """
-    # 1. Get Physics-Based Source
-    bioheat = calculate_standard_bioheat(frames, mask, config)
+    # Erode mask to exclude boundary artifacts (water bag edge, creases)
+    if boundary_erosion_px > 0:
+        eroded_mask = erode_mask(mask, erosion_px=boundary_erosion_px)
+    else:
+        eroded_mask = mask
+    
+    # 1. Get Physics-Based Source (using eroded mask)
+    bioheat = calculate_standard_bioheat(frames, eroded_mask, config)
     
     # 2. Get Pattern-Based Confidence Score (0-1)
-    score = calculate_3d_gradient_score(frames, mask, config)
+    score = calculate_3d_gradient_score(frames, eroded_mask, config)
     
     # 3. Apply Saturation Gain (Weighting)
     # Gain=2.0 means confidence > 0.5 yields full intensity
