@@ -249,12 +249,14 @@ def extract_structure(image, mask, apply_shape_filter=True, consensus_map=None, 
         use_ml_filter: If True, use trained ML classifier to filter regions.
         ml_threshold: Probability threshold for ML filter (default 0.5, lower = keep more).
     """
-    if not np.any(image > 0):
+    # Check if there's any valid data
+    valid_pixels = image[mask & (image > 0)]
+    if len(valid_pixels) == 0:
         return np.zeros_like(image), np.zeros_like(image)
         
     # Normalize to 0-255 for morphology
     img_norm = image.copy()
-    vmax = np.percentile(image[mask & (image > 0)], 99.5) if np.any(image > 0) else 1.0
+    vmax = np.percentile(valid_pixels, 99.5)
     img_uint8 = np.clip((img_norm / vmax) * 255, 0, 255).astype(np.uint8)
     
     # 1. Top-Hat Transform
