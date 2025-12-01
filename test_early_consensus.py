@@ -352,6 +352,22 @@ def process_patient_early_consensus(patient_base):
         }
         print(f"  ≥3 Agree + Simple @55th: {n_combo_3} regions")
     
+    # Early consensus (≥4) + Simple threshold (most conservative - all agree)
+    if n_used >= 4:
+        (consensus_map_4, _, _, _) = compute_early_consensus(
+            aligned_maps, aligned_masks, min_agreement=4, percentile_threshold=45
+        )
+        seg_combo_4 = simple_threshold_segmentation(consensus_map_4, combined_mask, percentile=45)
+        labeled, n_combo_4 = ndimage.label(seg_combo_4 > 0)
+        results['consensus_simple_4'] = {
+            'consensus_map': consensus_map_4,
+            'segmentation': seg_combo_4,
+            'n_regions': n_combo_4,
+            'combined_mask': combined_mask,
+            'threshold': '≥4 + simple@45th'
+        }
+        print(f"  ≥4 Agree + Simple @45th: {n_combo_4} regions")
+    
     # Also compute the old approach for comparison (no early consensus)
     stacked_no_consensus = np.mean(aligned_maps, axis=0)
     combined_mask = aligned_masks[0].copy()
@@ -374,17 +390,17 @@ def process_patient_early_consensus(patient_base):
 
 
 def create_comparison_figure(all_results, patient_names):
-    """Create comprehensive comparison showing agreement levels with binary masks."""
+    """Create comparison with original maps for each agreement level."""
     n_patients = len(all_results)
     
-    # Columns: Stacked Avg | ≥2 Map | ≥2 Seg | ≥2 Binary | ≥3 Map | ≥3 Seg | ≥3 Binary
+    # Columns: Stacked | ≥2 Map | ≥2 Seg | ≥3 Map | ≥3 Seg | ≥4 Map | ≥4 Seg
     n_cols = 7
-    fig, axes = plt.subplots(n_patients, n_cols, figsize=(2.5*n_cols, 2.8*n_patients))
+    fig, axes = plt.subplots(n_patients, n_cols, figsize=(2.3*n_cols, 2.5*n_patients))
     if n_patients == 1:
         axes = axes.reshape(1, -1)
     
     # Reduce spacing
-    plt.subplots_adjust(wspace=0.02, hspace=0.15)
+    plt.subplots_adjust(wspace=0.02, hspace=0.12)
     
     for i, (results, name) in enumerate(zip(all_results, patient_names)):
         if results is None:
@@ -417,19 +433,12 @@ def create_comparison_figure(all_results, patient_names):
             ax.set_title(title, fontsize=8, fontweight='bold')
             ax.axis('off')
         
-        def plot_binary(ax, data, title):
-            """Plot binary segmentation mask."""
-            seg = data['segmentation'] > 0
-            ax.imshow(seg, cmap='gray', vmin=0, vmax=1)
-            ax.set_title(title, fontsize=8, fontweight='bold')
-            ax.axis('off')
-        
-        # Column 0: Stacked Average
+        # Column 0: Stacked Average (original)
         if 'no_consensus' in results:
             d = results['no_consensus']
-            plot_map_only(axes[i, 0], d, f"{name}\nStacked Avg")
+            plot_map_only(axes[i, 0], d, f"{name}\nStacked")
         
-        # Column 1: ≥2 Agreement Map
+        # Column 1: ≥2 Map
         if 'consensus_simple_2' in results:
             d = results['consensus_simple_2']
             plot_map_only(axes[i, 1], d, "≥2 Map")
@@ -439,45 +448,48 @@ def create_comparison_figure(all_results, patient_names):
             d = results['consensus_simple_2']
             plot_map_with_contours(axes[i, 2], d, f"≥2 Seg ({d['n_regions']})", 'cyan')
         
-        # Column 3: ≥2 Binary
-        if 'consensus_simple_2' in results:
-            d = results['consensus_simple_2']
-            plot_binary(axes[i, 3], d, "≥2 Binary")
-        
-        # Column 4: ≥3 Agreement Map
+        # Column 3: ≥3 Map
         if 'consensus_simple_3' in results:
             d = results['consensus_simple_3']
-            plot_map_only(axes[i, 4], d, "≥3 Map")
+            plot_map_only(axes[i, 3], d, "≥3 Map")
         else:
-            axes[i, 4].set_title("N/A", fontsize=8)
+            axes[i, 3].set_title("N/A", fontsize=8)
+            axes[i, 3].axis('off')
+        
+        # Column 4: ≥3 Segmentation
+        if 'consensus_simple_3' in results:
+            d = results['consensus_simple_3']
+            plot_map_with_contours(axes[i, 4], d, f"≥3 Seg ({d['n_regions']})", 'lime')
+        else:
             axes[i, 4].axis('off')
         
-        # Column 5: ≥3 Segmentation
-        if 'consensus_simple_3' in results:
-            d = results['consensus_simple_3']
-            plot_map_with_contours(axes[i, 5], d, f"≥3 Seg ({d['n_regions']})", 'lime')
+        # Column 5: ≥4 Map
+        if 'consensus_simple_4' in results:
+            d = results['consensus_simple_4']
+            plot_map_only(axes[i, 5], d, "≥4 Map")
         else:
+            axes[i, 5].set_title("N/A", fontsize=8)
             axes[i, 5].axis('off')
         
-        # Column 6: ≥3 Binary
-        if 'consensus_simple_3' in results:
-            d = results['consensus_simple_3']
-            plot_binary(axes[i, 6], d, "≥3 Binary")
+        # Column 6: ≥4 Segmentation
+        if 'consensus_simple_4' in results:
+            d = results['consensus_simple_4']
+            plot_map_with_contours(axes[i, 6], d, f"≥4 Seg ({d['n_regions']})", 'yellow')
         else:
             axes[i, 6].axis('off')
     
-    plt.suptitle("Stacked Avg → ≥2 Agreement (Map|Seg|Binary) → ≥3 Agreement (Map|Seg|Binary)", 
-                 fontsize=12, fontweight='bold', y=0.98)
+    plt.suptitle("Stacked → ≥2 (Map|Seg) → ≥3 (Map|Seg) → ≥4 (Map|Seg)", 
+                 fontsize=11, fontweight='bold', y=0.99)
     
-    output_file = os.path.join(config.OUTPUT_DIR, "Test_ConsensusComparison.png")
-    plt.savefig(output_file, dpi=200, bbox_inches='tight', pad_inches=0.1)
+    output_file = os.path.join(config.OUTPUT_DIR, "Test_AgreementComparison.png")
+    plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0.1)
     print(f"\nSaved to {output_file}")
     plt.close()
 
 
 if __name__ == "__main__":
-    # Test with a few patients
-    patient_list = ["P15", "P16", "P20"]
+    # All patients from P08 to P25
+    patient_list = [f"P{i:02d}" for i in range(8, 26)]  # P08 to P25
     
     all_results = []
     valid_names = []
