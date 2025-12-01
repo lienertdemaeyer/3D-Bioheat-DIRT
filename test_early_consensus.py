@@ -389,18 +389,22 @@ def process_patient_early_consensus(patient_base):
     return results, n_used
 
 
-def create_comparison_figure(all_results, patient_names):
-    """Create comparison with original maps for each agreement level."""
+def create_comparison_figure(all_results, patient_names, batch_idx=0):
+    """Create comparison with maps and binary for each agreement level (3 patients per figure)."""
     n_patients = len(all_results)
     
-    # Columns: Stacked | ≥2 Map | ≥2 Seg | ≥3 Map | ≥3 Seg | ≥4 Map | ≥4 Seg
-    n_cols = 7
-    fig, axes = plt.subplots(n_patients, n_cols, figsize=(2.3*n_cols, 2.5*n_patients))
+    # Output folder for individual patient figures
+    output_folder = r"C:\Users\liene\Documents\DATA OUTPUT\3D-BIOHEAT-DIRT\consensus per patients"
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Columns: Stacked | ≥2 Map | ≥2 Seg | ≥2 Bin | ≥3 Map | ≥3 Seg | ≥3 Bin | ≥4 Map | ≥4 Seg | ≥4 Bin
+    n_cols = 10
+    fig, axes = plt.subplots(n_patients, n_cols, figsize=(2.0*n_cols, 3*n_patients))
     if n_patients == 1:
         axes = axes.reshape(1, -1)
     
     # Reduce spacing
-    plt.subplots_adjust(wspace=0.02, hspace=0.12)
+    plt.subplots_adjust(wspace=0.02, hspace=0.15)
     
     for i, (results, name) in enumerate(zip(all_results, patient_names)):
         if results is None:
@@ -429,7 +433,14 @@ def create_comparison_figure(all_results, patient_names):
             for c in contours:
                 c = c.squeeze()
                 if len(c.shape) == 2:
-                    ax.plot(c[:, 0], c[:, 1], contour_color, linewidth=1)
+                    ax.plot(c[:, 0], c[:, 1], contour_color, linewidth=1.2)
+            ax.set_title(title, fontsize=8, fontweight='bold')
+            ax.axis('off')
+        
+        def plot_binary(ax, data, title):
+            """Plot binary segmentation mask."""
+            seg = data['segmentation'] > 0
+            ax.imshow(seg, cmap='gray', vmin=0, vmax=1)
             ax.set_title(title, fontsize=8, fontweight='bold')
             ax.axis('off')
         
@@ -446,42 +457,64 @@ def create_comparison_figure(all_results, patient_names):
         # Column 2: ≥2 Segmentation
         if 'consensus_simple_2' in results:
             d = results['consensus_simple_2']
-            plot_map_with_contours(axes[i, 2], d, f"≥2 Seg ({d['n_regions']})", 'cyan')
+            plot_map_with_contours(axes[i, 2], d, f"≥2 ({d['n_regions']})", 'cyan')
         
-        # Column 3: ≥3 Map
+        # Column 3: ≥2 Binary
+        if 'consensus_simple_2' in results:
+            d = results['consensus_simple_2']
+            plot_binary(axes[i, 3], d, "≥2 Bin")
+        
+        # Column 4: ≥3 Map
         if 'consensus_simple_3' in results:
             d = results['consensus_simple_3']
-            plot_map_only(axes[i, 3], d, "≥3 Map")
+            plot_map_only(axes[i, 4], d, "≥3 Map")
         else:
-            axes[i, 3].set_title("N/A", fontsize=8)
-            axes[i, 3].axis('off')
-        
-        # Column 4: ≥3 Segmentation
-        if 'consensus_simple_3' in results:
-            d = results['consensus_simple_3']
-            plot_map_with_contours(axes[i, 4], d, f"≥3 Seg ({d['n_regions']})", 'lime')
-        else:
+            axes[i, 4].set_title("N/A", fontsize=8)
             axes[i, 4].axis('off')
         
-        # Column 5: ≥4 Map
-        if 'consensus_simple_4' in results:
-            d = results['consensus_simple_4']
-            plot_map_only(axes[i, 5], d, "≥4 Map")
+        # Column 5: ≥3 Segmentation
+        if 'consensus_simple_3' in results:
+            d = results['consensus_simple_3']
+            plot_map_with_contours(axes[i, 5], d, f"≥3 ({d['n_regions']})", 'lime')
         else:
-            axes[i, 5].set_title("N/A", fontsize=8)
             axes[i, 5].axis('off')
         
-        # Column 6: ≥4 Segmentation
-        if 'consensus_simple_4' in results:
-            d = results['consensus_simple_4']
-            plot_map_with_contours(axes[i, 6], d, f"≥4 Seg ({d['n_regions']})", 'yellow')
+        # Column 6: ≥3 Binary
+        if 'consensus_simple_3' in results:
+            d = results['consensus_simple_3']
+            plot_binary(axes[i, 6], d, "≥3 Bin")
         else:
             axes[i, 6].axis('off')
+        
+        # Column 7: ≥4 Map
+        if 'consensus_simple_4' in results:
+            d = results['consensus_simple_4']
+            plot_map_only(axes[i, 7], d, "≥4 Map")
+        else:
+            axes[i, 7].set_title("N/A", fontsize=8)
+            axes[i, 7].axis('off')
+        
+        # Column 8: ≥4 Segmentation
+        if 'consensus_simple_4' in results:
+            d = results['consensus_simple_4']
+            plot_map_with_contours(axes[i, 8], d, f"≥4 ({d['n_regions']})", 'yellow')
+        else:
+            axes[i, 8].axis('off')
+        
+        # Column 9: ≥4 Binary
+        if 'consensus_simple_4' in results:
+            d = results['consensus_simple_4']
+            plot_binary(axes[i, 9], d, "≥4 Bin")
+        else:
+            axes[i, 9].axis('off')
     
-    plt.suptitle("Stacked → ≥2 (Map|Seg) → ≥3 (Map|Seg) → ≥4 (Map|Seg)", 
-                 fontsize=11, fontweight='bold', y=0.99)
+    plt.suptitle("Stacked → ≥2 (Map|Seg|Bin) → ≥3 (Map|Seg|Bin) → ≥4 (Map|Seg|Bin)", 
+                 fontsize=11, fontweight='bold', y=0.98)
     
-    output_file = os.path.join(config.OUTPUT_DIR, "Test_AgreementComparison.png")
+    # Get patient names for filename
+    first_patient = patient_names[0].split()[0] if patient_names else "P00"
+    last_patient = patient_names[-1].split()[0] if patient_names else "P00"
+    output_file = os.path.join(output_folder, f"Consensus_{first_patient}-{last_patient}.png")
     plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0.1)
     print(f"\nSaved to {output_file}")
     plt.close()
@@ -501,7 +534,13 @@ if __name__ == "__main__":
             all_results.append(results)
             valid_names.append(f"{p} ({n_used} meas)")
     
-    if all_results:
-        create_comparison_figure(all_results, valid_names)
-        print(f"\nProcessed {len(all_results)} patients!")
+    # Process in batches of 3 patients per figure
+    batch_size = 3
+    for i in range(0, len(all_results), batch_size):
+        batch_results = all_results[i:i+batch_size]
+        batch_names = valid_names[i:i+batch_size]
+        if batch_results:
+            create_comparison_figure(batch_results, batch_names, batch_idx=i//batch_size)
+    
+    print(f"\nProcessed {len(all_results)} patients in {(len(all_results) + batch_size - 1) // batch_size} figures!")
 
