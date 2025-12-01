@@ -2,7 +2,7 @@ import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
+import cv2
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -12,119 +12,6 @@ from src.bioheat import calculate_hybrid_preserving
 from src.segmentation import extract_structure
 from src.registration import (register_and_stack_measurements, compute_stability_map, 
                                compute_union_tiered_map, compute_smart_consensus_map)
-
-# Load U-Net model if available
-UNET_MODEL = None
-def load_unet_model():
-    global UNET_MODEL
-    model_path = os.path.join(config.OUTPUT_DIR, 'unet_perforator.pth')
-    if os.path.exists(model_path):
-        from train_unet import UNetSmall
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        UNET_MODEL = UNetSmall().to(device)
-        UNET_MODEL.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        UNET_MODEL.eval()
-        print(f"Loaded Attention U-Net model from {model_path} ({device})")
-        return True
-    return False
-
-def unet_predict(hybrid_map, mask, intensity_filter=True):
-    """Apply U-Net to predict segmentation from hybrid map."""
-    if UNET_MODEL is None:
-        return None
-    
-    device = next(UNET_MODEL.parameters()).device
-    
-    # Normalize input
-    masked = hybrid_map * mask
-    if masked.max() > 0:
-        normalized = masked / masked.max()
-    else:
-        normalized = masked
-    
-    # Resize to 256x256 for U-Net
-    import cv2
-    h, w = hybrid_map.shape
-    resized = cv2.resize(normalized.astype(np.float32), (256, 256))
-    
-    # Predict
-    with torch.no_grad():
-        input_tensor = torch.from_numpy(resized).float().unsqueeze(0).unsqueeze(0).to(device)
-        output = UNET_MODEL(input_tensor)
-        pred = output.squeeze().cpu().numpy()
-    
-    # Resize back
-    pred_full = cv2.resize(pred, (w, h))
-    
-    # Binary threshold
-    binary = (pred_full > 0.35).astype(np.uint8)
-    
-    return binary
-
-
-def ensemble_segmentation(unet_seg, rule_seg, hybrid_map):
-    """
-    Simple ensemble: Rule-based (high detail) minus artifacts.
-    - Start with rule-based output (high resolution)
-    - Remove elongated structures that U-Net didn't detect (artifacts)
-    - Keep everything else
-    """
-    from scipy import ndimage
-    import cv2
-    
-    if unet_seg is None:
-        return rule_seg
-    
-    # Start with rule-based (high detail)
-    rule_binary = (rule_seg > 0).astype(np.uint8)
-    unet_binary = (unet_seg > 0).astype(np.uint8)
-    
-    # Label connected components in rule-based
-    labeled, num_features = ndimage.label(rule_binary)
-    filtered = np.zeros_like(rule_binary)
-    
-    for i in range(1, num_features + 1):
-        region_mask = labeled == i
-        region_area = np.sum(region_mask)
-        
-        # Check if U-Net also detected this region
-        overlap_with_unet = np.sum(unet_binary[region_mask]) / region_area if region_area > 0 else 0
-        in_unet = overlap_with_unet > 0.2  # At least 20% overlap
-        
-        # Calculate aspect ratio for artifact detection
-        coords = np.argwhere(region_mask)
-        if len(coords) > 5:
-            try:
-                (_, _), (w, h), _ = cv2.minAreaRect(coords.astype(np.float32))
-                aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
-            except:
-                aspect_ratio = 1.0
-        else:
-            aspect_ratio = 1.0
-        
-        is_elongated = aspect_ratio > 4.0
-        is_very_elongated = aspect_ratio > 8.0
-        
-        # Decision logic:
-        # 1. Confirmed by U-Net → always keep
-        # 2. Very elongated (>8) and NOT in U-Net → artifact, remove
-        # 3. Moderately elongated (4-8) and NOT in U-Net → artifact, remove
-        # 4. Compact shape → keep (likely real perforator)
-        
-        if in_unet:
-            # U-Net confirms it - keep
-            filtered[region_mask] = 1
-        elif is_very_elongated:
-            # Very long and U-Net didn't see it - definitely artifact
-            pass  # Don't add
-        elif is_elongated:
-            # Moderately elongated and U-Net didn't see it - likely artifact
-            pass  # Don't add
-        else:
-            # Compact shape - keep even if U-Net missed it
-            filtered[region_mask] = 1
-    
-    return filtered
 
 def process_patient_comparison(patient_base):
     """
@@ -275,12 +162,6 @@ def process_patient_comparison(patient_base):
     # Smart: pass consensus map so elongated shapes with high consensus are kept
     _, segment_smart = extract_structure(smart_map, union_mask, consensus_map=smart_confidence)
     
-    # U-Net prediction (if model loaded)
-    segment_unet = unet_predict(smart_map, union_mask)
-    
-    # Smart ensemble: U-Net + Rule-based + Intensity validation
-    segment_ensemble = ensemble_segmentation(segment_unet, segment_smart, smart_map)
-    
     return {
         'single': hybrid_maps[0],
         'stacked': stacked,
@@ -294,8 +175,6 @@ def process_patient_comparison(patient_base):
         'segment_stacked': segment_stacked,
         'segment_tiered': segment_tiered,
         'segment_smart': segment_smart,
-        'segment_unet': segment_unet,
-        'segment_ensemble': segment_ensemble,
         'mask': combined_mask,
         'union_mask': union_mask,
         'n_used': n_used
@@ -304,90 +183,64 @@ def process_patient_comparison(patient_base):
 def create_comparison_figure(patients_data, patient_names):
     """
     Create a side-by-side comparison figure for multiple patients.
-    Columns: Smart Consensus | Overlap Seg | Smart Seg | U-Net Seg | Comparison
+    Columns: Smart Consensus | Stacked Seg | Smart Seg | Overlay
     """
     n_patients = len(patients_data)
-    has_unet = patients_data[0].get('segment_unet') is not None
     
-    n_cols = 5 if has_unet else 4
-    fig, axes = plt.subplots(n_patients, n_cols, figsize=(5*n_cols, 5*n_patients))
+    n_cols = 4
+    fig, axes = plt.subplots(n_patients, n_cols, figsize=(4*n_cols, 4*n_patients))
     if n_patients == 1:
         axes = axes.reshape(1, -1)
-    
-    title = "U-Net Segmentation vs Rule-based" if has_unet else "Smart Consensus Segmentation"
-    plt.suptitle(title, fontsize=16, fontweight='bold', y=1.02)
     
     for i, (data, name) in enumerate(zip(patients_data, patient_names)):
         if data is None:
             continue
             
-        mask = data['mask']
         union_mask = data['union_mask']
+        mask = data['mask']
         
         # Column 0: Smart Consensus input
         smart = data['smart_map']
         vmax_s = np.percentile(smart[union_mask & (smart > 0)], 99.5) if np.any(smart > 0) else 1
         axes[i, 0].imshow(smart, cmap='magma', vmin=0, vmax=vmax_s)
-        axes[i, 0].set_title(f"{name}: Smart Consensus", fontsize=11)
+        axes[i, 0].set_title(f"{name}: Smart Consensus", fontsize=10)
         axes[i, 0].axis('off')
         
-        # Column 1: Intensity-gated union segmentation (ground truth)
-        seg_overlap = data['segment_stacked'] > 0
-        axes[i, 1].imshow(seg_overlap, cmap='gray')
-        axes[i, 1].set_title("Intensity-Gated GT", fontsize=11)
+        # Column 1: Stacked segmentation (overlap-based)
+        seg_stacked = data['segment_stacked'] > 0
+        axes[i, 1].imshow(seg_stacked, cmap='gray')
+        axes[i, 1].set_title("Stacked Segmentation", fontsize=10)
         axes[i, 1].axis('off')
         
-        # Column 2: Rule-based segmentation
+        # Column 2: Smart segmentation (rule-based)
         seg_smart = data['segment_smart'] > 0
         axes[i, 2].imshow(seg_smart, cmap='gray')
-        axes[i, 2].set_title("Rule-based Seg", fontsize=11)
+        axes[i, 2].set_title("Smart Segmentation", fontsize=10)
         axes[i, 2].axis('off')
         
-        if has_unet:
-            # Column 3: Smart Ensemble (U-Net + Rule-based + Intensity)
-            seg_ensemble = data['segment_ensemble'] > 0
-            axes[i, 3].imshow(seg_ensemble, cmap='gray')
-            axes[i, 3].set_title("Smart Ensemble", fontsize=11)
-            axes[i, 3].axis('off')
-            
-            # Column 4: Comparison (GT vs Ensemble)
-            overlay = np.zeros((*seg_overlap.shape, 3), dtype=np.uint8)
-            # Blue = only in GT (missed by ensemble)
-            overlay[seg_overlap & ~seg_ensemble] = [100, 100, 255]
-            # Green = only in ensemble (recovered/extra)
-            overlay[seg_ensemble & ~seg_overlap] = [0, 255, 100]
-            # White = both agree
-            overlay[seg_overlap & seg_ensemble] = [255, 255, 255]
-            
-            axes[i, 4].imshow(overlay)
-            axes[i, 4].set_title("White=match, Blue=missed, Green=recovered", fontsize=9)
-            axes[i, 4].axis('off')
-        else:
-            # Column 3: Comparison (Overlap vs Smart)
-            overlay = np.zeros((*seg_overlap.shape, 3), dtype=np.uint8)
-            overlay[seg_overlap & ~seg_smart] = [100, 100, 255]
-            overlay[seg_smart & ~seg_overlap] = [0, 255, 100]
-            overlay[seg_overlap & seg_smart] = [255, 255, 255]
-            
-            axes[i, 3].imshow(overlay)
-            axes[i, 3].set_title("White=both, Green=smart recovered", fontsize=9)
-            axes[i, 3].axis('off')
+        # Column 3: Overlay on input
+        smart_norm = smart / (vmax_s + 1e-8)
+        smart_norm = np.clip(smart_norm, 0, 1)
+        overlay = cv2.cvtColor((smart_norm * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+        
+        # Draw green contours for segmentation
+        contours, _ = cv2.findContours(seg_smart.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
+        
+        axes[i, 3].imshow(overlay)
+        axes[i, 3].set_title("Clinical Overlay", fontsize=10)
+        axes[i, 3].axis('off')
     
-    plt.suptitle("Rule-based (detailed) + U-Net Artifact Filter", fontsize=14, y=1.02)
+    plt.suptitle("Rule-based Perforator Segmentation", fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
     
-    output_file = os.path.join(config.OUTPUT_DIR, "Comparison_SmartEnsemble.png")
+    output_file = os.path.join(config.OUTPUT_DIR, "Comparison_RuleBased.png")
     plt.savefig(output_file, dpi=200, bbox_inches='tight')
     print(f"\nSaved comparison to {output_file}")
     plt.close()
 
 if __name__ == "__main__":
-    # Load U-Net model first
-    has_unet = load_unet_model()
-    if not has_unet:
-        print("No U-Net model found - run train_unet.py first!")
-    
-    # Test with patients
+    # Test with patients (rule-based segmentation)
     patient_list = ["P15", "P16", "P17", "P18", "P19", "P20", "P21"]
     
     results = []

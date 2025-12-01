@@ -133,38 +133,34 @@ def filter_by_ml(binary_map, hybrid_map, mask, threshold=0.5):
 
 
 def filter_by_shape(binary_map, min_circularity=0.15, max_aspect_ratio=5.0, min_area=15,
-                    consensus_map=None, min_consensus_ratio=0.5, hard_max_aspect=15.0,
+                    consensus_map=None, min_consensus_ratio=0.4, hard_max_aspect=15.0,
                     intensity_map=None, high_intensity_percentile=70,
                     min_width_px=4):
     """
     Filter segmentation to remove elongated stripe-like artifacts.
-    Keeps blob-like structures AND elongated structures if they have high consensus OR high intensity.
     
-    Args:
-        binary_map: Binary segmentation mask
-        min_circularity: Minimum circularity for shapes without validation
-        max_aspect_ratio: Maximum aspect ratio for shapes without validation
-        min_area: Minimum area in pixels
-        consensus_map: Optional map showing consensus values (0-1)
-        min_consensus_ratio: Minimum consensus to keep elongated shapes
-        hard_max_aspect: HARD LIMIT for very long thin shapes (edge artifacts)
-        intensity_map: Optional intensity map - high intensity shapes are kept
-        high_intensity_percentile: Percentile threshold for "high intensity"
+    Key insight: Real perforators appear CONSISTENTLY across measurements.
+    Artifacts (creases/folds) move between measurements → low consensus.
     
-    Returns:
-        Filtered binary map
+    Decision logic:
+    1. Blob-like shape (aspect < 4) → KEEP (real perforator shape)
+    2. Elongated (aspect >= 4) but has CONSENSUS → KEEP (consistent across measurements)
+    3. Elongated without consensus → REMOVE (artifact that moved)
+    4. Very thin (< 4px) elongated → REMOVE (definitely crease)
+    5. Extremely elongated (aspect > 15) thin → REMOVE (edge artifact)
     """
     binary_uint8 = (binary_map > 0).astype(np.uint8) * 255
     contours, _ = cv2.findContours(binary_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     filtered = np.zeros_like(binary_map, dtype=np.uint8)
     
-    # Calculate intensity threshold if intensity map provided
-    intensity_threshold = 0
+    # Calculate intensity thresholds
+    peak_intensity_threshold = 0
     if intensity_map is not None:
-        valid_intensities = intensity_map[binary_map > 0]
+        valid_intensities = intensity_map[intensity_map > 0]
         if len(valid_intensities) > 0:
-            intensity_threshold = np.percentile(valid_intensities, high_intensity_percentile)
+            # Top 20% = very bright peak
+            peak_intensity_threshold = np.percentile(valid_intensities, 80)
     
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -188,43 +184,56 @@ def filter_by_shape(binary_map, min_circularity=0.15, max_aspect_ratio=5.0, min_
             aspect_ratio = 1.0
             min_dim = 10  # Default
         
-        # THIN STRUCTURES are creases/folds, not perforators
-        # Skip very thin elongated structures regardless of intensity
-        if min_dim < min_width_px and aspect_ratio > 3.0:
-            continue
-        
-        # Create mask for this contour (needed for consensus/intensity checks)
+        # Create mask for this contour
         contour_mask = np.zeros_like(binary_map, dtype=np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 1, -1)
         
-        # Check if HIGH INTENSITY (bright = real perforator, keep regardless of shape)
-        is_high_intensity = False
+        # Get consensus (how consistently this appears across measurements)
+        has_good_consensus = False
+        mean_consensus = 0
+        if consensus_map is not None and np.sum(contour_mask) > 0:
+            mean_consensus = np.mean(consensus_map[contour_mask > 0])
+            # Require higher consensus for more elongated shapes
+            required_consensus = min_consensus_ratio + 0.03 * max(0, aspect_ratio - 4)
+            required_consensus = min(required_consensus, 0.7)  # Cap at 70%
+            has_good_consensus = mean_consensus >= required_consensus
+        
+        # Get intensity features
+        has_very_bright_peak = False
         if intensity_map is not None and np.sum(contour_mask) > 0:
-            mean_intensity = np.mean(intensity_map[contour_mask > 0])
-            is_high_intensity = mean_intensity >= intensity_threshold
+            max_intensity = np.max(intensity_map[contour_mask > 0])
+            has_very_bright_peak = max_intensity >= peak_intensity_threshold
         
-        # High intensity structures bypass shape filters (except extreme cases)
-        if is_high_intensity and aspect_ratio <= hard_max_aspect:
+        # Decision logic:
+        
+        # 1. Very thin elongated = definitely crease - REMOVE
+        is_thin_crease = min_dim < min_width_px and aspect_ratio > 3.0
+        if is_thin_crease:
+            continue
+        
+        # 2. Extremely elongated thin = edge artifact - REMOVE
+        is_extreme_artifact = aspect_ratio > hard_max_aspect and min_dim < 10
+        if is_extreme_artifact:
+            continue
+        
+        # 3. Blob-like shape (low aspect ratio) - KEEP
+        is_blob = aspect_ratio < 4.0
+        if is_blob:
             cv2.drawContours(filtered, [contour], -1, 255, -1)
             continue
         
-        # HARD LIMIT: Very long thin shapes are artifacts
-        if aspect_ratio > hard_max_aspect:
-            continue
+        # 4. Elongated (aspect >= 4) - ONLY keep if has consensus
+        # This is the key: artifacts move between measurements, real structures don't
+        is_elongated = aspect_ratio >= 4.0
         
-        # Check consensus for moderately elongated shapes
-        has_consensus = False
-        if consensus_map is not None and aspect_ratio > max_aspect_ratio:
-            if np.sum(contour_mask) > 0:
-                mean_consensus = np.mean(consensus_map[contour_mask > 0])
-                required_consensus = min_consensus_ratio + 0.05 * (aspect_ratio - max_aspect_ratio)
-                has_consensus = mean_consensus >= min(required_consensus, 0.7)
-        
-        # Keep if: blob-like OR has consensus
-        is_blob_like = circularity >= min_circularity and aspect_ratio <= max_aspect_ratio
-        
-        if is_blob_like or has_consensus:
-            cv2.drawContours(filtered, [contour], -1, 255, -1)
+        if is_elongated:
+            # Must have consensus OR be very bright AND wide
+            if has_good_consensus:
+                cv2.drawContours(filtered, [contour], -1, 255, -1)
+            elif has_very_bright_peak and min_dim >= 8:
+                # Wide bright structures are likely real even without consensus
+                cv2.drawContours(filtered, [contour], -1, 255, -1)
+            # else: skip (artifact without consensus)
     
     return filtered
 
