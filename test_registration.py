@@ -155,26 +155,28 @@ def process_patient_comparison(patient_base):
     for m in masks[1:]:
         union_mask = union_mask | m
     
-    # Segmentation from all approaches
-    _, segment_single = extract_structure(hybrid_maps[0], masks[0])  # Single (M01)
-    _, segment_stacked = extract_structure(stacked_filtered, combined_mask)  # Stacked+filtered (overlap)
-    _, segment_tiered = extract_structure(tiered_map, union_mask)  # Tiered (union)
-    # Smart: pass consensus map so elongated shapes with high consensus are kept
-    _, segment_smart = extract_structure(smart_map, union_mask, consensus_map=smart_confidence)
+    # Create stacked maps at different agreement levels
+    # stability values: 0.25 = 1/4, 0.5 = 2/4, 0.75 = 3/4, 1.0 = 4/4
+    stacked_2of4 = stacked * (stability >= 0.5)   # At least 2 agree (50%)
+    stacked_3of4 = stacked * (stability >= 0.75)  # At least 3 agree (75%)
+    stacked_4of4 = stacked * (stability >= 1.0)   # All 4 agree (100%)
+    
+    # Segmentation at different agreement levels
+    _, segment_2of4 = extract_structure(stacked_2of4, combined_mask)
+    _, segment_3of4 = extract_structure(stacked_3of4, combined_mask)
+    _, segment_4of4 = extract_structure(stacked_4of4, combined_mask)
     
     return {
         'single': hybrid_maps[0],
         'stacked': stacked,
-        'stacked_filtered': stacked_filtered,
         'stability': stability,
-        'tiered_map': tiered_map,
         'smart_map': smart_map,
-        'smart_confidence': smart_confidence,
-        'confidence_map': confidence_map,
-        'segment_single': segment_single,
-        'segment_stacked': segment_stacked,
-        'segment_tiered': segment_tiered,
-        'segment_smart': segment_smart,
+        'stacked_2of4': stacked_2of4,
+        'stacked_3of4': stacked_3of4,
+        'stacked_4of4': stacked_4of4,
+        'segment_2of4': segment_2of4,
+        'segment_3of4': segment_3of4,
+        'segment_4of4': segment_4of4,
         'mask': combined_mask,
         'union_mask': union_mask,
         'n_used': n_used
@@ -183,12 +185,12 @@ def process_patient_comparison(patient_base):
 def create_comparison_figure(patients_data, patient_names):
     """
     Create a side-by-side comparison figure for multiple patients.
-    Columns: Smart Consensus | Stacked Seg | Smart Seg | Overlay
+    Columns: Input | ≥2/4 agree | ≥3/4 agree | 4/4 agree | Overlay (best)
     """
     n_patients = len(patients_data)
     
-    n_cols = 4
-    fig, axes = plt.subplots(n_patients, n_cols, figsize=(4*n_cols, 4*n_patients))
+    n_cols = 5
+    fig, axes = plt.subplots(n_patients, n_cols, figsize=(3.5*n_cols, 3.5*n_patients))
     if n_patients == 1:
         axes = axes.reshape(1, -1)
     
@@ -203,38 +205,50 @@ def create_comparison_figure(patients_data, patient_names):
         smart = data['smart_map']
         vmax_s = np.percentile(smart[union_mask & (smart > 0)], 99.5) if np.any(smart > 0) else 1
         axes[i, 0].imshow(smart, cmap='magma', vmin=0, vmax=vmax_s)
-        axes[i, 0].set_title(f"{name}: Smart Consensus", fontsize=10)
+        axes[i, 0].set_title(f"{name}: Input", fontsize=10)
         axes[i, 0].axis('off')
         
-        # Column 1: Stacked segmentation (overlap-based)
-        seg_stacked = data['segment_stacked'] > 0
-        axes[i, 1].imshow(seg_stacked, cmap='gray')
-        axes[i, 1].set_title("Stacked Segmentation", fontsize=10)
+        # Column 1: At least 2/4 agree (50%)
+        seg_2of4 = data['segment_2of4'] > 0
+        axes[i, 1].imshow(seg_2of4, cmap='gray')
+        n_regions_2 = len(np.unique(cv2.connectedComponents(seg_2of4.astype(np.uint8))[1])) - 1
+        axes[i, 1].set_title(f"≥2/4 agree ({n_regions_2} regions)", fontsize=10)
         axes[i, 1].axis('off')
         
-        # Column 2: Smart segmentation (rule-based)
-        seg_smart = data['segment_smart'] > 0
-        axes[i, 2].imshow(seg_smart, cmap='gray')
-        axes[i, 2].set_title("Smart Segmentation", fontsize=10)
+        # Column 2: At least 3/4 agree (75%)
+        seg_3of4 = data['segment_3of4'] > 0
+        axes[i, 2].imshow(seg_3of4, cmap='gray')
+        n_regions_3 = len(np.unique(cv2.connectedComponents(seg_3of4.astype(np.uint8))[1])) - 1
+        axes[i, 2].set_title(f"≥3/4 agree ({n_regions_3} regions)", fontsize=10)
         axes[i, 2].axis('off')
         
-        # Column 3: Overlay on input
-        smart_norm = smart / (vmax_s + 1e-8)
-        smart_norm = np.clip(smart_norm, 0, 1)
-        overlay = cv2.cvtColor((smart_norm * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
-        
-        # Draw green contours for segmentation
-        contours, _ = cv2.findContours(seg_smart.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
-        
-        axes[i, 3].imshow(overlay)
-        axes[i, 3].set_title("Clinical Overlay", fontsize=10)
+        # Column 3: All 4/4 agree (100%)
+        seg_4of4 = data['segment_4of4'] > 0
+        axes[i, 3].imshow(seg_4of4, cmap='gray')
+        n_regions_4 = len(np.unique(cv2.connectedComponents(seg_4of4.astype(np.uint8))[1])) - 1
+        axes[i, 3].set_title(f"4/4 agree ({n_regions_4} regions)", fontsize=10)
         axes[i, 3].axis('off')
+        
+        # Column 4: Overlay comparison (color-coded)
+        # Show what's in each level with different colors
+        overlay = np.zeros((*seg_2of4.shape, 3), dtype=np.uint8)
+        # Red = only in 2/4 (removed at higher thresholds)
+        only_2of4 = seg_2of4 & ~seg_3of4
+        overlay[only_2of4] = [255, 100, 100]
+        # Yellow = in 3/4 but not 4/4
+        only_3of4 = seg_3of4 & ~seg_4of4
+        overlay[only_3of4] = [255, 255, 100]
+        # Green = in all 4/4 (most reliable)
+        overlay[seg_4of4] = [100, 255, 100]
+        
+        axes[i, 4].imshow(overlay)
+        axes[i, 4].set_title("Green=4/4, Yellow=3/4, Red=2/4 only", fontsize=8)
+        axes[i, 4].axis('off')
     
-    plt.suptitle("Rule-based Perforator Segmentation", fontsize=14, fontweight='bold', y=1.02)
+    plt.suptitle("Agreement Level Comparison: How many measurements must agree?", fontsize=12, fontweight='bold', y=1.02)
     plt.tight_layout()
     
-    output_file = os.path.join(config.OUTPUT_DIR, "Comparison_RuleBased.png")
+    output_file = os.path.join(config.OUTPUT_DIR, "Comparison_AgreementLevels.png")
     plt.savefig(output_file, dpi=200, bbox_inches='tight')
     print(f"\nSaved comparison to {output_file}")
     plt.close()
